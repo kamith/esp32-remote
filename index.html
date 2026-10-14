@@ -185,7 +185,7 @@ code{font:500 .9em ui-monospace,Consolas,monospace;background:var(--bg);padding:
 
   // ---- state ----
   const base = "esp32dash/" + pair.id + "/";
-  let relayUp = false, boardOnline = null, state = null, lastStateAt = 0;
+  let relayUp = false, boardOnline = null, offlineAt = 0, state = null, lastStateAt = 0;
   const samples = [];  // {t, pct|null}
 
   function hex(bytes) { return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join(""); }
@@ -195,8 +195,10 @@ code{font:500 .9em ui-monospace,Consolas,monospace;background:var(--bg);padding:
   }
 
   function render() {
+    // The board sends state at least every 5 s. Fresh state means it's online, even if the relay
+    // still holds an old "offline" notice; an "offline" that arrives after the last state wins.
     const fresh = state && Date.now() - lastStateAt < 15000;
-    const live = relayUp && boardOnline !== false && fresh;
+    const live = relayUp && fresh && !(offlineAt > lastStateAt);
     const pill = $("pill");
     if (!relayUp) { pill.dataset.state = "connecting"; pill.textContent = "Connecting"; }
     else if (live) { pill.dataset.state = "online"; pill.textContent = "Board online"; }
@@ -272,7 +274,10 @@ code{font:500 .9em ui-monospace,Consolas,monospace;background:var(--bg);padding:
   for (const ev of ["close", "offline", "error"]) client.on(ev, () => { relayUp = client.connected; render(); });
   client.on("message", (topic, payload) => {
     const text = payload.toString();
-    if (topic === base + "online") boardOnline = text === "1";
+    if (topic === base + "online") {
+      boardOnline = text === "1";
+      if (!boardOnline) offlineAt = Date.now();
+    }
     else if (topic === base + "state") {
       try { state = JSON.parse(text); } catch (e) { return; }
       lastStateAt = Date.now();
