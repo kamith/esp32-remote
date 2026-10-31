@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>P4 Camera</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600&family=Barlow:wght@400;500;600&display=swap">
+<style>
+/* Layout: one column - status strip, the picture, picture size, footer meta. */
+:root{
+  --bg:#eef1ef; --panel:#fbfcfb; --ink:#18211e; --muted:#5f6d68; --line:#d5dcd9;
+  --accent:#0e7c6b; --warn:#b4540f;
+  --display:"Barlow Condensed","Arial Narrow",system-ui,sans-serif;
+  --body:"Barlow",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0f1514; --panel:#161e1c; --ink:#e6eeeb; --muted:#8fa09a; --line:#26322f;
+  --accent:#34c6ad; --warn:#f08a4b; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0f1514; --panel:#161e1c; --ink:#e6eeeb; --muted:#8fa09a; --line:#26322f;
+  --accent:#34c6ad; --warn:#f08a4b; color-scheme:dark}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 var(--body);
+  padding:max(16px,env(safe-area-inset-top)) 16px max(24px,env(safe-area-inset-bottom))}
+.wrap{max-width:860px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.brand{font:600 1.35rem/1 var(--display);letter-spacing:.02em}
+.brand small{display:block;font:500 .72rem/1.2 var(--body);color:var(--muted);letter-spacing:.06em;text-transform:uppercase;margin-top:4px}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:5px 12px;border-radius:999px;border:1px solid var(--line);
+  font:600 .78rem/1 var(--body);color:var(--muted);background:var(--panel);white-space:nowrap}
+.pill::before{content:"";width:8px;height:8px;border-radius:50%;background:currentColor}
+.pill[data-state=online]{color:var(--accent);border-color:var(--accent)}
+.pill[data-state=offline]{color:var(--warn);border-color:var(--warn)}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px}
+.label{font:600 .74rem/1 var(--body);letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}
+.video{position:relative;background:#000;border-radius:12px;overflow:hidden;aspect-ratio:16/9;display:grid;place-items:center}
+.video canvas{width:100%;height:100%;object-fit:contain;display:block}
+.video p{position:absolute;margin:0;padding:16px;color:#fff;text-align:center}
+.sizes{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:12px}
+button{font:600 1rem/1 var(--body);border-radius:10px;padding:14px 10px;cursor:pointer;border:1px solid var(--accent);
+  background:transparent;color:var(--accent)}
+button[aria-pressed=true]{background:var(--accent);color:var(--panel)}
+button:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 45%,transparent);outline-offset:2px}
+.meta{margin:0;color:var(--muted);font-size:.82rem;text-align:center;font-variant-numeric:tabular-nums}
+.textbtn{background:none;border:0;color:var(--muted);font:500 .82rem var(--body);text-decoration:underline;padding:6px;align-self:center}
+.steps{margin:10px 0 0;padding-left:20px}
+.steps li{margin:6px 0}
+code{font:500 .9em ui-monospace,Consolas,monospace;background:var(--bg);padding:1px 5px;border-radius:5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">P4 Camera<small id="boardname">Live view, from anywhere</small></div>
+    <span class="pill" id="pill" data-state="connecting">Connecting</span>
+  </header>
+
+  <section class="panel" id="unpaired" hidden>
+    <div class="label">Pair this phone</div>
+    <p>This page shows one camera, and it needs that camera's key first. You only do this once.</p>
+    <ol class="steps">
+      <li>At home, on the same network as the camera, open <code>http://p4cam.local</code>.</li>
+      <li>Under <b>Watch from anywhere</b>, tap <b>Set up phone remote</b>.</li>
+      <li>Scan the QR code with this phone, or open the link on it.</li>
+    </ol>
+  </section>
+
+  <main id="app" hidden style="display:flex;flex-direction:column;gap:14px">
+    <div class="video"><canvas id="view" width="640" height="360" aria-label="Live camera view"></canvas><p id="overlay">Waiting for the camera</p></div>
+    <section class="panel">
+      <div class="label">Picture size</div>
+      <div class="sizes" id="sizes"></div>
+    </section>
+    <p class="meta" id="meta">Connecting to the relay&hellip;</p>
+    <button class="textbtn" id="unpair">Unpair this phone</button>
+  </main>
+</div>
+
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script>
+(() => {
+  const RELAY = "wss://broker.hivemq.com:8884/mqtt";
+  const STORE = "p4cam.pair";
+  const PROFILE = "p4cam.profile";
+  const WATCH_EVERY_MS = 5000;
+  const $ = id => document.getElementById(id);
+  const enc = new TextEncoder();
+
+  // ---- pairing: the camera's dashboard links here with "#<deviceId>.<key>" ----
+  function loadPair() {
+    const m = location.hash.match(/^#([0-9a-f]{16})\.([0-9a-f]{64})$/);
+    if (m) {
+      const p = { id: m[1], key: m[2] };
+      try { localStorage.setItem(STORE, JSON.stringify(p)); } catch (e) {}
+      history.replaceState(null, "", location.pathname + location.search);  // keep the key out of history
+      return p;
+    }
+    try {
+      const p = JSON.parse(localStorage.getItem(STORE) || "null");
+      if (p && /^[0-9a-f]{16}$/.test(p.id) && /^[0-9a-f]{64}$/.test(p.key)) return p;
+    } catch (e) {}
+    return null;
+  }
+
+  const pair = loadPair();
+  if (!pair) {
+    $("unpaired").hidden = false;
+    $("pill").textContent = "Not paired";
+    return;
+  }
+  $("app").hidden = false;
+  $("boardname").textContent = "Camera " + pair.id.slice(0, 4) + "…" + pair.id.slice(-4);
+  $("unpair").onclick = () => {
+    try { localStorage.removeItem(STORE); } catch (e) {}
+    location.reload();
+  };
+
+  function hex(bytes) { return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join(""); }
+  function unhex(text) { return Uint8Array.from(text.match(/../g), b => parseInt(b, 16)); }
+  function dur(s) {
+    const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60);
+    return h ? h + "h " + m + "m" : m ? m + "m " + (s % 60) + "s" : s + "s";
+  }
+
+  // ---- keys: both are HMAC-SHA256 of the pairing key with a fixed label, matching remote.c ----
+  async function derive(label) {
+    const master = await crypto.subtle.importKey("raw", unhex(pair.key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    return crypto.subtle.sign("HMAC", master, enc.encode(label));
+  }
+  const keys = (async () => {
+    const frame = await crypto.subtle.importKey("raw", await derive("p4cam frame v1"), "AES-GCM", false, ["decrypt"]);
+    const watch = await crypto.subtle.importKey("raw", await derive("p4cam watch v1"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    return { frame, watch };
+  })();
+
+  // ---- state ----
+  const base = "p4cam/" + pair.id + "/";
+  const aad = enc.encode(pair.id);
+  let relayUp = false, boardOnline = null, state = null, lastStateAt = 0, lastFrameAt = 0;
+  let badFrames = 0, drawing = null, waiting = null;
+  let shown = 0, received = 0, bytes = 0, fps = 0, kbps = 0, rateAt = Date.now();
+  let profile = "low";
+  try { profile = localStorage.getItem(PROFILE) || "low"; } catch (e) {}
+
+  const canvas = $("view"), ctx = canvas.getContext("2d");
+
+  function render() {
+    const now = Date.now();
+    const elapsed = (now - rateAt) / 1000;
+    if (elapsed >= 2) {
+      fps = shown / elapsed; kbps = bytes / 1024 / elapsed;
+      shown = 0; bytes = 0; rateAt = now;
+    }
+    const fresh = state && now - lastStateAt < 15000;
+    const video = now - lastFrameAt < 4000;
+    const live = relayUp && (fresh || video) && boardOnline !== false;
+    const pill = $("pill");
+    if (!relayUp) { pill.dataset.state = "connecting"; pill.textContent = "Connecting"; }
+    else if (video) { pill.dataset.state = "online"; pill.textContent = "Live"; }
+    else if (live) { pill.dataset.state = "online"; pill.textContent = "Camera online"; }
+    else if (boardOnline === null && !state) { pill.dataset.state = "connecting"; pill.textContent = "Waiting for camera"; }
+    else { pill.dataset.state = "offline"; pill.textContent = "Camera offline"; }
+
+    const overlay = $("overlay");
+    overlay.hidden = video;
+    overlay.textContent = badFrames > 3 && !received ? "This phone's key doesn't match the camera. Pair it again."
+      : !relayUp ? "Connecting to the relay"
+      : !live ? "The camera is offline"
+      : state && !state.cam ? "The camera isn't detected. Check its USB cable."
+      : "Waiting for video";
+
+    if (!relayUp) $("meta").textContent = "Connecting to the relay…";
+    else if (video) {
+      $("meta").textContent = canvas.width + "×" + canvas.height + " · " + fps.toFixed(1) + " fps · " + Math.round(kbps) + " KB/s" +
+        (state ? " · " + state.net + " · up " + dur(state.up) : "");
+    } else $("meta").textContent = state ? "Camera up " + dur(state.up) + " on " + state.net : "Connected to the relay. Waiting for the camera…";
+  }
+
+  // ---- picture size ----
+  const SIZES = [["low", "360p"], ["med", "540p"], ["high", "720p"]];
+  function drawSizes() {
+    const box = $("sizes");
+    box.innerHTML = "";
+    for (const [value, text] of SIZES) {
+      const b = document.createElement("button");
+      b.textContent = text;
+      b.setAttribute("aria-pressed", value === profile);
+      b.onclick = () => {
+        profile = value;
+        try { localStorage.setItem(PROFILE, value); } catch (e) {}
+        drawSizes();
+        sendWatch();
+      };
+      box.appendChild(b);
+    }
+  }
+  drawSizes();
+
+  // ---- signed watch request: "<unix time>|<nonce>|<profile>|<HMAC-SHA256(key, id|time|nonce|profile)>" ----
+  async function sendWatch() {
+    if (!client.connected || document.hidden) return;
+    const { watch } = await keys;
+    const ts = String(Math.floor(Date.now() / 1000));
+    const nonce = hex(crypto.getRandomValues(new Uint8Array(8)));
+    const body = ts + "|" + nonce + "|" + profile;
+    const mac = hex(new Uint8Array(await crypto.subtle.sign("HMAC", watch, enc.encode(pair.id + "|" + body))));
+    client.publish(base + "watch", body + "|" + mac, { qos: 0, retain: false });
+  }
+
+  // ---- frames: 0x01, 12-byte IV, AES-256-GCM ciphertext and tag ----
+  async function showFrame(packet) {
+    const { frame } = await keys;
+    let plain;
+    try {
+      plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: packet.subarray(1, 13), additionalData: aad, tagLength: 128 }, frame, packet.subarray(13));
+    } catch (e) { badFrames++; return; }
+    const bitmap = await createImageBitmap(new Blob([plain], { type: "image/jpeg" }));
+    if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+      canvas.width = bitmap.width; canvas.height = bitmap.height;
+    }
+    ctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    received++; shown++;
+    lastFrameAt = Date.now();
+  }
+
+  // Only the newest frame is kept while one is being drawn, so a slow phone never falls behind.
+  function queueFrame(packet) {
+    if (packet.length < 30 || packet[0] !== 1) return;
+    bytes += packet.length;
+    if (drawing) { waiting = packet; return; }
+    drawing = showFrame(packet).catch(() => {}).finally(() => {
+      drawing = null;
+      if (waiting) { const next = waiting; waiting = null; queueFrame(next); }
+    });
+  }
+
+  // ---- relay connection ----
+  const client = mqtt.connect(RELAY, {
+    clientId: "p4cam-view-" + hex(crypto.getRandomValues(new Uint8Array(6))),
+    clean: true, keepalive: 30, reconnectPeriod: 3000, connectTimeout: 10000
+  });
+  client.on("connect", () => {
+    relayUp = true;
+    client.subscribe([base + "frame", base + "state", base + "online"], { qos: 0 }, sendWatch);
+    render();
+  });
+  for (const ev of ["close", "offline", "error"]) client.on(ev, () => { relayUp = client.connected; render(); });
+  client.on("message", (topic, payload) => {
+    if (topic === base + "frame") { queueFrame(payload); return; }
+    const text = payload.toString();
+    if (topic === base + "online") boardOnline = text === "1";
+    else if (topic === base + "state") {
+      try { state = JSON.parse(text); } catch (e) { return; }
+      lastStateAt = Date.now();
+      boardOnline = true;
+    }
+    render();
+  });
+
+  setInterval(sendWatch, WATCH_EVERY_MS);
+  setInterval(render, 1000);
+  document.addEventListener("visibilitychange", sendWatch);
+  render();
+})();
+</script>
+</body>
+</html>
