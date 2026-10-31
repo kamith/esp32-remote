@@ -47,6 +47,9 @@ button{font:600 1rem/1 var(--body);border-radius:10px;padding:14px 10px;cursor:p
   background:transparent;color:var(--accent)}
 button[aria-pressed=true]{background:var(--accent);color:var(--panel)}
 button:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 45%,transparent);outline-offset:2px}
+.vol{display:flex;align-items:center;gap:10px;margin-top:14px;color:var(--muted);font-size:.9rem}
+.vol input{flex:1;min-width:0;accent-color:var(--accent)}
+.soundstate{margin:10px 0 0;min-height:1.3em;color:var(--muted);font-size:.9rem}
 .meta{margin:0;color:var(--muted);font-size:.82rem;text-align:center;font-variant-numeric:tabular-nums}
 .textbtn{background:none;border:0;color:var(--muted);font:500 .82rem var(--body);text-decoration:underline;padding:6px;align-self:center}
 .steps{margin:10px 0 0;padding-left:20px}
@@ -77,6 +80,16 @@ code{font:500 .9em ui-monospace,Consolas,monospace;background:var(--bg);padding:
       <div class="label">Picture size</div>
       <div class="sizes" id="sizes"></div>
     </section>
+    <section class="panel">
+      <div class="label">Make noise</div>
+      <div class="sizes" id="sounds">
+        <button data-sound="beep">Beep</button>
+        <button data-sound="chime">Chime</button>
+        <button data-sound="alarm">Alarm</button>
+      </div>
+      <label class="vol">Volume <input id="vol" type="range" min="10" max="100" step="10" value="70"></label>
+      <p class="soundstate" id="soundstate" aria-live="polite"></p>
+    </section>
     <p class="meta" id="meta">Connecting to the relay&hellip;</p>
     <button class="textbtn" id="unpair">Unpair this phone</button>
   </main>
@@ -88,6 +101,7 @@ code{font:500 .9em ui-monospace,Consolas,monospace;background:var(--bg);padding:
   const RELAY = "wss://broker.hivemq.com:8884/mqtt";
   const STORE = "p4cam.pair";
   const PROFILE = "p4cam.profile";
+  const VOLUME = "p4cam.volume";
   const WATCH_EVERY_MS = 5000;
   const $ = id => document.getElementById(id);
   const enc = new TextEncoder();
@@ -136,7 +150,8 @@ code{font:500 .9em ui-monospace,Consolas,monospace;background:var(--bg);padding:
   const keys = (async () => {
     const frame = await crypto.subtle.importKey("raw", await derive("p4cam frame v1"), "AES-GCM", false, ["decrypt"]);
     const watch = await crypto.subtle.importKey("raw", await derive("p4cam watch v1"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-    return { frame, watch };
+    const cmd = await crypto.subtle.importKey("raw", await derive("p4cam cmd v1"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    return { frame, watch, cmd };
   })();
 
   // ---- state ----
@@ -213,6 +228,39 @@ code{font:500 .9em ui-monospace,Consolas,monospace;background:var(--bg);padding:
     client.publish(base + "watch", body + "|" + mac, { qos: 0, retain: false });
   }
 
+  // ---- signed sound command: "<unix time>|<nonce>|<sound>|<volume>|<HMAC-SHA256(key, id|time|nonce|sound|volume)>" ----
+  const SOUND_TEXT = {
+    playing: "Playing on the camera…",
+    done: "Played",
+    busy: "A sound is already playing",
+    expired: "Not played. Check that this phone's clock is automatic.",
+    unknown: "The camera doesn't know that sound. Update its firmware.",
+    replayed: "Not played"
+  };
+  let soundNonce = "", soundTimer = 0;
+
+  function soundState(text) {
+    clearTimeout(soundTimer);
+    $("soundstate").textContent = text;
+  }
+
+  async function playSound(name) {
+    if (!client.connected) { soundState("Not connected to the relay"); return; }
+    const { cmd } = await keys;
+    const ts = String(Math.floor(Date.now() / 1000));
+    const nonce = hex(crypto.getRandomValues(new Uint8Array(8)));
+    const body = ts + "|" + nonce + "|" + name + "|" + $("vol").value;
+    const mac = hex(new Uint8Array(await crypto.subtle.sign("HMAC", cmd, enc.encode(pair.id + "|" + body))));
+    client.publish(base + "cmd", body + "|" + mac, { qos: 0, retain: false });
+    soundNonce = nonce;
+    soundState("Sending…");
+    soundTimer = setTimeout(() => { $("soundstate").textContent = "No reply from the camera"; }, 8000);
+  }
+
+  for (const b of document.querySelectorAll("[data-sound]")) b.onclick = () => playSound(b.dataset.sound);
+  try { $("vol").value = localStorage.getItem(VOLUME) || "70"; } catch (e) {}
+  $("vol").onchange = () => { try { localStorage.setItem(VOLUME, $("vol").value); } catch (e) {} };
+
   // ---- frames: 0x01, 12-byte IV, AES-256-GCM ciphertext and tag ----
   async function showFrame(packet) {
     const { frame } = await keys;
@@ -248,13 +296,20 @@ code{font:500 .9em ui-monospace,Consolas,monospace;background:var(--bg);padding:
   });
   client.on("connect", () => {
     relayUp = true;
-    client.subscribe([base + "frame", base + "state", base + "online"], { qos: 0 }, sendWatch);
+    client.subscribe([base + "frame", base + "state", base + "online", base + "ack"], { qos: 0 }, sendWatch);
     render();
   });
   for (const ev of ["close", "offline", "error"]) client.on(ev, () => { relayUp = client.connected; render(); });
   client.on("message", (topic, payload) => {
     if (topic === base + "frame") { queueFrame(payload); return; }
     const text = payload.toString();
+    if (topic === base + "ack") {
+      try {
+        const ack = JSON.parse(text);
+        if (ack.n === soundNonce) soundState(SOUND_TEXT[ack.s] || ack.s);
+      } catch (e) {}
+      return;
+    }
     if (topic === base + "online") boardOnline = text === "1";
     else if (topic === base + "state") {
       try { state = JSON.parse(text); } catch (e) { return; }
